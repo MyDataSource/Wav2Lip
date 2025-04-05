@@ -59,6 +59,22 @@ parser.add_argument('--lip_saturation', type=float, default=1.0,
                     help='唇部饱和度提升。1.0表示不变，大于1的值会增加唇部颜色鲜艳度')
 parser.add_argument('--image_mode', action='store_true', default=False,
                     help='启用简化的图像处理模式。处理静态图像时使用直接替换方法，没有复杂的混合处理')
+parser.add_argument('--color_match', action='store_true', default=False,
+                    help='启用严格的颜色匹配，确保生成的视频与原始图片颜色一致')
+parser.add_argument('--color_match_mode', type=str, default='histogram', choices=['simple', 'histogram', 'reinhard'],
+                    help='颜色匹配算法: simple=简单统计匹配, histogram=直方图匹配, reinhard=Reinhard色调映射')
+parser.add_argument('--video_color_preserve', action='store_true', default=False,
+                    help='视频模式下也启用颜色保持，确保视频输出颜色与原始视频一致')
+parser.add_argument('--color_strength', type=float, default=1.0,
+                    help='颜色匹配强度，0.0表示不匹配，1.0表示完全匹配')
+parser.add_argument('--advanced_color', action='store_true', default=False,
+                    help='启用高级颜色处理，包括多阶段色彩校正和局部颜色保持，对静态图像特别有效')
+parser.add_argument('--global_color', action='store_true', default=False,
+                    help='启用全局颜色校正，将处理整个图像而不仅仅是面部区域，彻底消除色差')
+parser.add_argument('--color_preserve', type=float, default=0.9,
+                    help='色彩保留强度，值越高越保留原图颜色 (0.0-1.0)，默认0.9表示保留90%原图色调')
+parser.add_argument('--mouth_only', action='store_true', default=False,
+                    help='仅改变嘴部区域，完全保持其他区域不变，彻底解决色差问题')
 
 args = parser.parse_args()
 args.img_size = 96  # 固定为96，原始模型仅支持这个尺寸
@@ -304,6 +320,391 @@ def load_model(path):
     print("Model successfully loaded and moved to {}".format(device))
     return model.eval()
 
+def color_match(source, target, mode='simple', strength=1.0):
+    """高级颜色匹配函数，支持多种匹配算法
+    
+    Args:
+        source: 源图像（要调整颜色的图像）
+        target: 目标图像（提供颜色分布的参考图像）
+        mode: 颜色匹配模式，支持'simple'、'histogram'和'reinhard'
+        strength: 颜色匹配强度，0.0表示不匹配，1.0表示完全匹配
+        
+    Returns:
+        颜色匹配后的源图像
+    """
+    if strength <= 0.0:
+        return source.copy().astype(np.uint8)
+        
+    source = source.copy().astype(np.float32)
+    target = target.copy().astype(np.float32)
+    
+    # 确保图像大小一致
+    if source.shape != target.shape:
+        target = cv2.resize(target, (source.shape[1], source.shape[0]))
+    
+    # 如果不需要完全匹配，则准备原始源图像用于混合
+    orig_source = source.copy() if strength < 1.0 else None
+    
+    if mode == 'simple':
+        # 简单的颜色统计匹配
+        matched = np.zeros_like(source)
+        for c in range(3):
+            src_mean, src_std = np.mean(source[:,:,c]), np.std(source[:,:,c])
+            tgt_mean, tgt_std = np.mean(target[:,:,c]), np.std(target[:,:,c])
+            
+            if src_std == 0:
+                src_std = 1.0
+                
+            # 标准化并重新缩放
+            matched[:,:,c] = ((source[:,:,c] - src_mean) / src_std * tgt_std + tgt_mean)
+            
+        # 裁剪到有效范围
+        matched = np.clip(matched, 0, 255).astype(np.uint8)
+        
+    elif mode == 'histogram':
+        # 直方图匹配 - 分别在各通道上进行
+        matched = np.zeros_like(source)
+        
+        for c in range(3):
+            # 计算累积直方图
+            src_hist, _ = np.histogram(source[:,:,c].flatten(), 256, [0, 256], density=True)
+            tgt_hist, _ = np.histogram(target[:,:,c].flatten(), 256, [0, 256], density=True)
+            
+            src_cdf = src_hist.cumsum()
+            tgt_cdf = tgt_hist.cumsum()
+            
+            # 归一化
+            src_cdf = src_cdf / (src_cdf[-1] if src_cdf[-1] > 0 else 1)
+            tgt_cdf = tgt_cdf / (tgt_cdf[-1] if tgt_cdf[-1] > 0 else 1)
+            
+            # 创建查找表
+            lookup_table = np.zeros(256, dtype=np.uint8)
+            for i in range(256):
+                # 找到最接近的CDF值
+                lookup_table[i] = np.argmin(np.abs(src_cdf[i] - tgt_cdf))
+            
+            # 应用查找表
+            matched[:,:,c] = lookup_table[source[:,:,c].astype(np.uint8)]
+        
+        matched = matched.astype(np.uint8)
+        
+    elif mode == 'reinhard':
+        # Reinhard色调映射 - 在Lab颜色空间中工作
+        # 转换为Lab颜色空间
+        source_lab = cv2.cvtColor(source.astype(np.uint8), cv2.COLOR_BGR2Lab).astype(np.float32)
+        target_lab = cv2.cvtColor(target.astype(np.uint8), cv2.COLOR_BGR2Lab).astype(np.float32)
+        
+        # 分离Lab通道
+        source_l, source_a, source_b = cv2.split(source_lab)
+        target_l, target_a, target_b = cv2.split(target_lab)
+        
+        # 计算均值和标准差
+        src_mean_l, src_std_l = np.mean(source_l), np.std(source_l)
+        tgt_mean_l, tgt_std_l = np.mean(target_l), np.std(target_l)
+        
+        src_mean_a, src_std_a = np.mean(source_a), np.std(source_a)
+        tgt_mean_a, tgt_std_a = np.mean(target_a), np.std(target_a)
+        
+        src_mean_b, src_std_b = np.mean(source_b), np.std(source_b)
+        tgt_mean_b, tgt_std_b = np.mean(target_b), np.std(target_b)
+        
+        # 避免除以零
+        if src_std_l == 0: src_std_l = 1
+        if src_std_a == 0: src_std_a = 1
+        if src_std_b == 0: src_std_b = 1
+        
+        # 标准化并重新缩放
+        matched_l = ((source_l - src_mean_l) / src_std_l * tgt_std_l + tgt_mean_l)
+        matched_a = ((source_a - src_mean_a) / src_std_a * tgt_std_a + tgt_mean_a)
+        matched_b = ((source_b - src_mean_b) / src_std_b * tgt_std_b + tgt_mean_b)
+        
+        # 合并通道
+        matched_lab = cv2.merge([matched_l, matched_a, matched_b])
+        
+        # 转换回BGR
+        matched = cv2.cvtColor(matched_lab.astype(np.uint8), cv2.COLOR_Lab2BGR)
+    
+    else:
+        return source.astype(np.uint8)
+    
+    # 如果需要按强度混合
+    if strength < 1.0 and orig_source is not None:
+        # 确保类型一致
+        matched = matched.astype(np.float32)
+        orig_source = orig_source.astype(np.float32)
+        
+        # 线性混合
+        blended = cv2.addWeighted(orig_source, 1.0 - strength, matched, strength, 0)
+        return np.clip(blended, 0, 255).astype(np.uint8)
+    
+    return matched
+
+def advanced_color_correction(source, target):
+    """
+    高级颜色校正，专为静态图像设计
+    使用多阶段颜色校正和局部颜色保持
+    
+    Args:
+        source: 源图像（模型生成的嘴部区域）
+        target: 目标图像（原始图像的嘴部区域）
+    
+    Returns:
+        颜色校正后的源图像
+    """
+    source = source.copy().astype(np.float32)
+    target = target.copy().astype(np.float32)
+    
+    # 确保图像大小一致
+    if source.shape != target.shape:
+        target = cv2.resize(target, (source.shape[1], source.shape[0]))
+    
+    # 步骤1: 全局颜色匹配 - 使用Reinhard算法在Lab空间
+    # 转换为Lab颜色空间
+    source_lab = cv2.cvtColor(source.astype(np.uint8), cv2.COLOR_BGR2Lab).astype(np.float32)
+    target_lab = cv2.cvtColor(target.astype(np.uint8), cv2.COLOR_BGR2Lab).astype(np.float32)
+    
+    # 分离Lab通道
+    source_l, source_a, source_b = cv2.split(source_lab)
+    target_l, target_a, target_b = cv2.split(target_lab)
+    
+    # 计算均值和标准差
+    src_mean_l, src_std_l = np.mean(source_l), np.std(source_l)
+    tgt_mean_l, tgt_std_l = np.mean(target_l), np.std(target_l)
+    
+    src_mean_a, src_std_a = np.mean(source_a), np.std(source_a)
+    tgt_mean_a, tgt_std_a = np.mean(target_a), np.std(target_a)
+    
+    src_mean_b, src_std_b = np.mean(source_b), np.std(source_b)
+    tgt_mean_b, tgt_std_b = np.mean(target_b), np.std(target_b)
+    
+    # 避免除以零
+    if src_std_l == 0: src_std_l = 1
+    if src_std_a == 0: src_std_a = 1
+    if src_std_b == 0: src_std_b = 1
+    
+    # 标准化并重新缩放
+    matched_l = ((source_l - src_mean_l) / src_std_l * tgt_std_l + tgt_mean_l)
+    matched_a = ((source_a - src_mean_a) / src_std_a * tgt_std_a + tgt_mean_a)
+    matched_b = ((source_b - src_mean_b) / src_std_b * tgt_std_b + tgt_mean_b)
+    
+    # 合并通道
+    matched_lab = cv2.merge([matched_l, matched_a, matched_b])
+    
+    # 转换回BGR
+    global_matched = cv2.cvtColor(matched_lab.astype(np.uint8), cv2.COLOR_Lab2BGR)
+    
+    # 步骤2: 局部区域细化 - 分割图像为网格进行局部颜色匹配
+    h, w = source.shape[:2]
+    grid_size = min(h, w) // 4  # 网格大小
+    
+    # 创建结果图像
+    result = global_matched.copy()
+    
+    # 定义嘴巴区域（通常位于图像下半部分中心）
+    mouth_y1 = int(h * 0.5)
+    mouth_y2 = int(h * 0.8)
+    mouth_x1 = int(w * 0.3)
+    mouth_x2 = int(w * 0.7)
+    
+    # 在嘴巴区域应用直方图匹配
+    mouth_src = global_matched[mouth_y1:mouth_y2, mouth_x1:mouth_x2]
+    mouth_tgt = target.astype(np.uint8)[mouth_y1:mouth_y2, mouth_x1:mouth_x2]
+    
+    for c in range(3):
+        # 计算累积直方图
+        src_hist, _ = np.histogram(mouth_src[:,:,c].flatten(), 256, [0, 256], density=True)
+        tgt_hist, _ = np.histogram(mouth_tgt[:,:,c].flatten(), 256, [0, 256], density=True)
+        
+        src_cdf = src_hist.cumsum()
+        tgt_cdf = tgt_hist.cumsum()
+        
+        # 归一化
+        src_cdf = src_cdf / (src_cdf[-1] if src_cdf[-1] > 0 else 1)
+        tgt_cdf = tgt_cdf / (tgt_cdf[-1] if tgt_cdf[-1] > 0 else 1)
+        
+        # 创建查找表
+        lookup_table = np.zeros(256, dtype=np.uint8)
+        for i in range(256):
+            # 找到最接近的CDF值
+            lookup_table[i] = np.argmin(np.abs(src_cdf[i] - tgt_cdf))
+        
+        # 应用查找表
+        result[mouth_y1:mouth_y2, mouth_x1:mouth_x2, c] = lookup_table[mouth_src[:,:,c]]
+    
+    # 步骤3: 皮肤色调匹配
+    # 皮肤检测 - 使用简单的HSV范围检测
+    hsv = cv2.cvtColor(target.astype(np.uint8), cv2.COLOR_BGR2HSV)
+    
+    # 宽松的肤色范围
+    lower_skin = np.array([0, 20, 70], dtype=np.uint8)
+    upper_skin = np.array([50, 255, 255], dtype=np.uint8)
+    
+    # 创建掩码
+    skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
+    
+    # 形态学操作改进掩码
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel)
+    skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel)
+    
+    # 膨胀以覆盖更多区域
+    skin_mask = cv2.dilate(skin_mask, kernel, iterations=2)
+    
+    # 将掩码归一化为0-1
+    skin_mask_float = skin_mask.astype(np.float32) / 255.0
+    
+    # 扩展掩码到3通道
+    skin_mask_3ch = np.stack([skin_mask_float] * 3, axis=2)
+    
+    # 从原始目标图像中提取肤色统计信息
+    skin_target = target.astype(np.uint8) * skin_mask_3ch
+    
+    # 只在有肤色的区域计算统计信息
+    if np.sum(skin_mask) > 0:
+        for c in range(3):
+            # 不对黑色区域进行计算
+            skin_pixels = skin_target[:,:,c][skin_mask > 0]
+            if len(skin_pixels) > 0:
+                target_skin_mean = np.mean(skin_pixels)
+                
+                # 对结果图像的相同区域进行调整
+                result_skin = result[:,:,c] * skin_mask_float
+                result_skin_mean = np.mean(result_skin[skin_mask > 0]) if np.sum(skin_mask) > 0 else 0
+                
+                # 如果有有效值，进行调整
+                if result_skin_mean > 0:
+                    # 计算偏移量
+                    offset = target_skin_mean - result_skin_mean
+                    
+                    # 只对皮肤区域进行调整
+                    mask_indices = skin_mask > 0
+                    result[mask_indices, c] = np.clip(result[mask_indices, c] + offset, 0, 255)
+    
+    # 步骤4: 平滑过渡处理 - 皮肤和非皮肤区域的平滑过渡
+    # 使用高斯模糊来平滑掩码边缘
+    smooth_mask = cv2.GaussianBlur(skin_mask_float, (21, 21), 0)
+    smooth_mask_3ch = np.stack([smooth_mask] * 3, axis=2)
+    
+    # 混合结果图像和全局匹配图像
+    # 皮肤区域使用肤色调整结果，非皮肤区域使用全局匹配结果
+    final_result = global_matched * (1 - smooth_mask_3ch) + result * smooth_mask_3ch
+    
+    return np.clip(final_result, 0, 255).astype(np.uint8)
+
+def global_color_correction(source_image, target_image, face_coords=None):
+    """
+    全局颜色校正函数，处理整个图像以消除色差
+    
+    Args:
+        source_image: 源图像（处理后的图像）
+        target_image: 目标图像（原始图像）
+        face_coords: 面部坐标，用于调整权重 (y1,y2,x1,x2)
+        
+    Returns:
+        全局色彩校正后的图像
+    """
+    # 深拷贝以避免修改原始图像
+    source = source_image.copy()
+    target = target_image.copy()
+    
+    # 如果启用了仅嘴部模式，仅保留嘴部变化，其他区域完全使用原图
+    if args.mouth_only and face_coords is not None:
+        y1, y2, x1, x2 = face_coords
+        h, w = source.shape[:2]
+        
+        # 嘴部区域通常在面部下半部分，我们仅保留这部分的变化
+        mouth_y1 = y1 + int((y2 - y1) * 0.5)  # 面部下半部分
+        mouth_x1 = x1 + int((x2 - x1) * 0.25)  # 面部中央区域
+        mouth_x2 = x2 - int((x2 - x1) * 0.25)
+        
+        # 创建一个蒙版，仅保留嘴部区域
+        mask = np.zeros((h, w), dtype=np.float32)
+        # 嘴部区域设为1，表示使用source图像
+        mask[mouth_y1:y2, mouth_x1:mouth_x2] = 1.0
+        
+        # 平滑过渡
+        mask = cv2.GaussianBlur(mask, (31, 31), 0)
+        
+        # 将蒙版扩展到3通道
+        mask = np.stack([mask] * 3, axis=2)
+        
+        # 混合图像
+        result = target * (1 - mask) + source * mask
+        return result.astype(np.uint8)
+    
+    # 正常的全局颜色校正
+    # 在Lab色彩空间中进行处理
+    source_lab = cv2.cvtColor(source, cv2.COLOR_BGR2Lab)
+    target_lab = cv2.cvtColor(target, cv2.COLOR_BGR2Lab)
+    
+    # 如果提供了面部坐标，创建面部区域蒙版和权重
+    if face_coords is not None:
+        y1, y2, x1, x2 = face_coords
+        h, w = source.shape[:2]
+        
+        # 创建权重蒙版，面部区域权重低，其他区域权重高
+        weight_mask = np.ones((h, w), dtype=np.float32) * args.color_preserve
+        
+        # 面部区域的权重降低（使用指定权重）
+        face_weight = max(0.0, min(0.5, 1.0 - args.color_preserve))
+        weight_mask[y1:y2, x1:x2] = face_weight
+        
+        # 使用高斯模糊使权重过渡平滑
+        weight_mask = cv2.GaussianBlur(weight_mask, (51, 51), 0)
+    else:
+        # 如果没有面部坐标，使用统一权重
+        weight_mask = np.ones(source.shape[:2], dtype=np.float32) * args.color_preserve
+    
+    # 对每个通道分别应用直方图匹配
+    result_lab = source_lab.copy()
+    
+    # 处理L通道 - 亮度
+    source_l = source_lab[:,:,0]
+    target_l = target_lab[:,:,0]
+    
+    # 计算源图像和目标图像的直方图
+    src_hist, _ = np.histogram(source_l.flatten(), 256, [0, 256], density=True)
+    tgt_hist, _ = np.histogram(target_l.flatten(), 256, [0, 256], density=True)
+    
+    # 计算累积分布函数
+    src_cdf = src_hist.cumsum()
+    tgt_cdf = tgt_hist.cumsum()
+    
+    # 归一化CDF
+    src_cdf_normalized = src_cdf / (src_cdf[-1] if src_cdf[-1] > 0 else 1)
+    tgt_cdf_normalized = tgt_cdf / (tgt_cdf[-1] if tgt_cdf[-1] > 0 else 1)
+    
+    # 创建查找表
+    lookup_table = np.zeros(256, dtype=np.uint8)
+    for i in range(256):
+        lookup_table[i] = np.argmin(np.abs(src_cdf_normalized[i] - tgt_cdf_normalized))
+    
+    # 应用查找表
+    matched_l = lookup_table[source_l]
+    
+    # 根据权重混合原始亮度和匹配的亮度
+    result_lab[:,:,0] = source_l * (1 - weight_mask) + matched_l * weight_mask
+    
+    # 处理A通道 - 红绿
+    source_a = source_lab[:,:,1]
+    target_a = target_lab[:,:,1]
+    
+    # 直接保留原始A通道
+    result_lab[:,:,1] = source_a * (1 - weight_mask) + target_a * weight_mask
+    
+    # 处理B通道 - 蓝黄
+    source_b = source_lab[:,:,2]
+    target_b = target_lab[:,:,2]
+    
+    # 直接保留原始B通道
+    result_lab[:,:,2] = source_b * (1 - weight_mask) + target_b * weight_mask
+    
+    # 将结果从Lab转换回BGR
+    result = cv2.cvtColor(result_lab, cv2.COLOR_Lab2BGR)
+    
+    # 确保结果在有效范围内
+    return np.clip(result, 0, 255).astype(np.uint8)
+
 def main():
     if not os.path.isfile(args.face):
         raise ValueError('--face argument must be a valid path to video/image file')
@@ -461,11 +862,38 @@ def main():
             
             # 图像模式 - 直接替换
             if args.static and args.image_mode:
+                # 保存原始帧的副本用于颜色匹配和比较
+                original_frame = f.copy()
+                
                 # 直接调整大小并替换 - 简单的图像处理模式
                 p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
-                f[y1:y2, x1:x2] = p
+                
+                # 如果启用了颜色匹配，确保与原始图像颜色匹配
+                if args.color_match:
+                    # 获取原始脸部区域
+                    orig_face = f[y1:y2, x1:x2].copy()
+                    
+                    # 使用高级颜色处理
+                    if args.advanced_color:
+                        p = advanced_color_correction(p, orig_face)
+                    else:
+                        # 使用标准颜色匹配算法
+                        p = color_match(p, orig_face, mode=args.color_match_mode, strength=args.color_strength)
+                
+                # 将处理后的面部放回原始图像
+                f_copy = f.copy()
+                f_copy[y1:y2, x1:x2] = p
+                
+                # 全局颜色校正（如果启用）
+                if args.global_color or args.mouth_only:
+                    f = global_color_correction(f_copy, original_frame, face_coords=(y1, y2, x1, x2))
+                else:
+                    f = f_copy
             else:
                 # 标准视频处理模式 - 使用复杂的混合和增强
+                # 保存原始帧的副本用于颜色匹配和比较
+                original_frame = f.copy()
+                
                 # 计算面部大小
                 face_h, face_w = y2-y1, x2-x1
                 
@@ -473,8 +901,22 @@ def main():
                 p_upscaled = cv2.resize(p.astype(np.uint8), (face_w, face_h), 
                                       interpolation=cv2.INTER_LANCZOS4)
                 
-                # 创建面部区域的原始图像
-                original_face = f[y1:y2, x1:x2].copy()
+                # 获取原始面部区域用于局部颜色匹配
+                original_face = original_frame[y1:y2, x1:x2].copy()
+                
+                # 颜色匹配 - 确保生成的脸部与原始脸部颜色一致
+                if (args.color_match or args.video_color_preserve) and not args.static:
+                    # 对整个生成的脸部进行颜色匹配，视频处理模式
+                    p_upscaled = color_match(p_upscaled.astype(np.uint8), 
+                                            original_face.astype(np.uint8), 
+                                            mode=args.color_match_mode,
+                                            strength=args.color_strength)
+                elif args.color_match and args.static:
+                    # 静态图像处理模式
+                    p_upscaled = color_match(p_upscaled.astype(np.uint8), 
+                                            original_face.astype(np.uint8), 
+                                            mode=args.color_match_mode,
+                                            strength=args.color_strength)
                 
                 # 确保两个面部数组类型一致以避免类型不匹配错误
                 original_face = original_face.astype(np.float32)
@@ -646,7 +1088,14 @@ def main():
                 blended_face = np.clip(blended_face, 0, 255).astype(np.uint8)
                 
                 # 将混合后的面部放回原始图像
-                f[y1:y2, x1:x2] = blended_face
+                f_copy = f.copy()
+                f_copy[y1:y2, x1:x2] = blended_face
+                
+                # 全局颜色校正（如果启用）
+                if args.global_color or args.mouth_only:
+                    f = global_color_correction(f_copy, original_face, face_coords=(y1, y2, x1, x2))
+                else:
+                    f = f_copy
             
             out.write(f)
     
@@ -666,7 +1115,13 @@ def main():
     # 超分辨率增强输出视频
     print("增强最终视频质量...")
     # 首先生成不带音频的增强版本，特别增强边缘锐度和细节
-    enhance_cmd = 'ffmpeg -y -i {} -vf "scale=iw*1.5:ih*1.5:flags=lanczos, eq=brightness=0.05:saturation=1.2:contrast=1.1, unsharp=5:5:1.5:5:5:0.0, unsharp=3:3:1.0:3:3:0.0" -c:v libx264 -crf 17 -preset slow -pix_fmt yuv420p temp/enhanced.mp4'.format(temp_avi)
+    # 如果启用了色彩匹配，使用更温和的增强参数，保持颜色一致性
+    if args.color_match or args.video_color_preserve or args.advanced_color:
+        # 更保守的视频处理参数，保持颜色
+        enhance_cmd = 'ffmpeg -y -i {} -vf "scale=iw*1.5:ih*1.5:flags=lanczos, eq=brightness=0:saturation=1.0:contrast=1.0, unsharp=3:3:0.8:3:3:0.0" -c:v libx264 -crf 17 -preset slow -pix_fmt yuv420p temp/enhanced.mp4'.format(temp_avi)
+    else:
+        # 标准增强参数
+        enhance_cmd = 'ffmpeg -y -i {} -vf "scale=iw*1.5:ih*1.5:flags=lanczos, eq=brightness=0.05:saturation=1.2:contrast=1.1, unsharp=5:5:1.5:5:5:0.0, unsharp=3:3:1.0:3:3:0.0" -c:v libx264 -crf 17 -preset slow -pix_fmt yuv420p temp/enhanced.mp4'.format(temp_avi)
     
     try:
         subprocess.call(enhance_cmd, shell=True)
